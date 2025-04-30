@@ -1,0 +1,367 @@
+import cv2
+import numpy as np
+from kivy.app import App
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.label import Label
+from kivy.uix.button import Button
+from kivy.clock import Clock
+from kivy.graphics.texture import Texture
+from kivy.uix.image import Image
+import mediapipe as mp
+
+class MotionDetectorApp(App):
+    def build(self):
+        self.layout = BoxLayout(orientation='vertical', padding=10, spacing=10)
+        
+        # UI Components
+        self.label = Label(text="Gerakan Belum Terdeteksi", font_size=24)
+        self.layout.add_widget(self.label)
+        
+        self.image = Image()
+        self.layout.add_widget(self.image)
+        
+        button = Button(text="Keluar", size_hint=(1, 0.2))
+        button.bind(on_press=self.stop_app)
+        self.layout.add_widget(button)
+        
+        # Initialize camera
+        self.capture = cv2.VideoCapture(0)
+        
+        # MediaPipe initialization with higher sensitivity
+        self.mp_pose = mp.solutions.pose
+        self.pose = self.mp_pose.Pose(
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.7
+        )
+        
+        self.mp_hands = mp.solutions.hands
+        self.hands = self.mp_hands.Hands(
+            min_detection_confidence=0.6,
+            min_tracking_confidence=0.6,
+            max_num_hands=2
+        )
+        
+        self.mp_drawing = mp.solutions.drawing_utils
+        
+        # Head movement tracking with additional hold detection
+        self.prev_nose_y = None
+        self.prev_nose_x = None
+        self.neutral_nose_x = None
+        self.neutral_nose_y = None
+        self.calibration_frames = 0
+        self.calibration_needed = True
+        self.calibration_threshold = 30  # Number of frames to establish neutral position
+        
+        # Position thresholds
+        self.head_movement_threshold = 0.05  # Threshold to detect intentional movement
+        self.hold_threshold = 0.04  # Threshold to determine if position is being held
+        
+        # Hold state tracking
+        self.current_hold_state = "Neutral"
+        self.hold_frames = 0
+        self.hold_frames_threshold = 15  # Frames required to consider a position "held"
+        self.hold_positions = {
+            "Left": 0,
+            "Right": 0,
+            "Up": 0,
+            "Down": 0,
+            "Neutral": 0
+        }
+        
+        # Arm position tracking
+        self.arm_positions = {
+            "BothArmsExtended": 0,
+            "LeftArmExtended": 0,
+            "RightArmExtended": 0,
+            "ArmsDown": 0,
+            "BothHandsRaised": 0,
+            "RightHandRaised": 0,
+            "LeftHandRaised": 0
+        }
+        self.arm_hold_threshold = 15  # Frames to consider arm position held
+        self.arm_extension_threshold = 0.15  # How far arm needs to be from body
+        self.hand_raise_threshold = 0.2  # Threshold for raised hands (vertical position)
+        
+        # Hand gesture tracking
+        self.finger_count_history = []
+        self.history_length = 5
+        
+        Clock.schedule_interval(self.update_frame, 1.0/30.0)
+        return self.layout
+    
+    def update_frame(self, dt):
+        ret, frame = self.capture.read()
+        if not ret:
+            return
+        
+        frame = cv2.flip(frame, 1)
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Process pose and hands
+        results_pose = self.pose.process(frame_rgb)
+        results_hands = self.hands.process(frame_rgb)
+        
+        # Reset detection flags to prevent overlap
+        motion_detected = False
+        head_gesture_active = False
+        arm_gesture_active = False
+        hand_gesture_active = False
+        
+        # Track active gesture type for priority
+        active_gesture_type = None
+        active_gesture_frames = 0
+        active_gesture_text = ""
+        active_gesture_display = ""
+        
+        # Head and arm position detection with hold functionality
+        if results_pose.pose_landmarks:
+            landmarks = results_pose.pose_landmarks.landmark
+            nose = landmarks[self.mp_pose.PoseLandmark.NOSE]
+            
+            # Extract key arm landmarks
+            left_shoulder = landmarks[self.mp_pose.PoseLandmark.LEFT_SHOULDER]
+            right_shoulder = landmarks[self.mp_pose.PoseLandmark.RIGHT_SHOULDER]
+            left_elbow = landmarks[self.mp_pose.PoseLandmark.LEFT_ELBOW]
+            right_elbow = landmarks[self.mp_pose.PoseLandmark.RIGHT_ELBOW]
+            left_wrist = landmarks[self.mp_pose.PoseLandmark.LEFT_WRIST]
+            right_wrist = landmarks[self.mp_pose.PoseLandmark.RIGHT_WRIST]
+            
+            # Current positions
+            current_nose_x = nose.x
+            current_nose_y = nose.y
+            
+            # Calibration phase - establish neutral position
+            if self.calibration_needed:
+                if self.calibration_frames < self.calibration_threshold:
+                    if self.neutral_nose_x is None:
+                        self.neutral_nose_x = current_nose_x
+                        self.neutral_nose_y = current_nose_y
+                    else:
+                        # Slowly adjust to account for slight movements during calibration
+                        self.neutral_nose_x = 0.9 * self.neutral_nose_x + 0.1 * current_nose_x
+                        self.neutral_nose_y = 0.9 * self.neutral_nose_y + 0.1 * current_nose_y
+                    
+                    self.calibration_frames += 1
+                    self.label.text = f"Kalibrasi... {self.calibration_frames}/{self.calibration_threshold}"
+                    cv2.putText(frame, f"KALIBRASI: {self.calibration_frames}/{self.calibration_threshold}", 
+                               (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                else:
+                    self.calibration_needed = False
+                    self.label.text = "Kalibrasi Selesai - Siap Deteksi"
+            else:
+                # Calculate position relative to neutral
+                x_diff = current_nose_x - self.neutral_nose_x
+                y_diff = current_nose_y - self.neutral_nose_y
+                
+                # Determine current head position
+                current_position = "Neutral"
+                if abs(x_diff) > abs(y_diff):  # Horizontal movement is dominant
+                    if x_diff > self.head_movement_threshold:
+                        current_position = "Right"
+                    elif x_diff < -self.head_movement_threshold:
+                        current_position = "Left"
+                else:  # Vertical movement is dominant
+                    if y_diff > self.head_movement_threshold:
+                        current_position = "Down"
+                    elif y_diff < -self.head_movement_threshold:
+                        current_position = "Up"
+                
+                # Update head position hold counters
+                for position in self.hold_positions:
+                    if position == current_position:
+                        self.hold_positions[position] += 1
+                    else:
+                        self.hold_positions[position] = 0
+                
+                # Detect arm positions
+                # Calculate horizontal and vertical distances for arms
+                left_arm_horizontal = abs(left_wrist.x - left_shoulder.x)
+                right_arm_horizontal = abs(right_wrist.x - right_shoulder.x)
+                left_arm_vertical = abs(left_wrist.y - left_shoulder.y)
+                right_arm_vertical = abs(right_wrist.y - right_shoulder.y)
+                
+                # Determine current arm position
+                left_arm_extended = left_arm_horizontal > self.arm_extension_threshold and left_wrist.y < left_shoulder.y + 0.1
+                right_arm_extended = right_arm_horizontal > self.arm_extension_threshold and right_wrist.y < right_shoulder.y + 0.1
+                
+                # Detect raised hands (vertical position)
+                left_hand_raised = left_wrist.y < left_shoulder.y - self.hand_raise_threshold
+                right_hand_raised = right_wrist.y < right_shoulder.y - self.hand_raise_threshold
+                
+                current_arm_position = "ArmsDown"
+                if left_hand_raised and right_hand_raised:
+                    current_arm_position = "BothHandsRaised"
+                elif left_hand_raised:
+                    current_arm_position = "LeftHandRaised"
+                elif right_hand_raised:
+                    current_arm_position = "RightHandRaised"
+                elif left_arm_extended and right_arm_extended:
+                    current_arm_position = "BothArmsExtended"
+                elif left_arm_extended:
+                    current_arm_position = "LeftArmExtended"
+                elif right_arm_extended:
+                    current_arm_position = "RightArmExtended"
+                
+                # Update arm position hold counters
+                for position in self.arm_positions:
+                    if position == current_arm_position:
+                        self.arm_positions[position] += 1
+                    else:
+                        self.arm_positions[position] = 0
+                
+                # Show debug info for arms
+                cv2.putText(frame, f"Left arm H: {left_arm_horizontal:.3f}", (50, 190), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                cv2.putText(frame, f"Right arm H: {right_arm_horizontal:.3f}", (50, 220), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                cv2.putText(frame, f"Arm Position: {current_arm_position}", (50, 250), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                
+                # Check for held head positions
+                for position, frames in self.hold_positions.items():
+                    if frames >= self.hold_frames_threshold and position != "Neutral":
+                        if frames > active_gesture_frames:  # Higher frame count gets priority
+                            head_gesture_active = True
+                            active_gesture_frames = frames
+                            active_gesture_type = "Head"
+                            
+                            # Prepare text for display
+                            hold_duration = frames / 30.0  # Convert frames to seconds (assuming 30fps)
+                            
+                            if position in ["Left", "Right"]:
+                                active_gesture_text = f"Kepala Geleng ke {position} (Tahan: {hold_duration:.1f}s)"
+                                active_gesture_display = f"GELENG {position.upper()}: {hold_duration:.1f}s"
+                            else:
+                                active_gesture_text = f"Kepala Angguk ke {position} (Tahan: {hold_duration:.1f}s)"
+                                active_gesture_display = f"ANGGUK {position.upper()}: {hold_duration:.1f}s"
+                
+                # Check for held arm positions - only if no head gesture is active or arm gesture has more frames
+                for position, frames in self.arm_positions.items():
+                    if frames >= self.arm_hold_threshold and position != "ArmsDown":
+                        if frames > active_gesture_frames:  # Higher frame count gets priority
+                            arm_gesture_active = True
+                            active_gesture_frames = frames
+                            active_gesture_type = "Arm"
+                            
+                            # Prepare text for display
+                            hold_duration = frames / 30.0  # Convert frames to seconds (assuming 30fps)
+                            
+                            if position == "BothArmsExtended":
+                                active_gesture_text = f"Kedua Tangan Direntangkan (Tahan: {hold_duration:.1f}s)"
+                                active_gesture_display = f"KEDUA TANGAN DIRENTANGKAN: {hold_duration:.1f}s"
+                            elif position == "LeftArmExtended":
+                                active_gesture_text = f"Tangan Kiri Direntangkan (Tahan: {hold_duration:.1f}s)"
+                                active_gesture_display = f"TANGAN KIRI DIRENTANGKAN: {hold_duration:.1f}s"
+                            elif position == "RightArmExtended":
+                                active_gesture_text = f"Tangan Kanan Direntangkan (Tahan: {hold_duration:.1f}s)"
+                                active_gesture_display = f"TANGAN KANAN DIRENTANGKAN: {hold_duration:.1f}s"
+                            elif position == "BothHandsRaised":
+                                active_gesture_text = f"Kedua Tangan Diangkat (Tahan: {hold_duration:.1f}s)"
+                                active_gesture_display = f"KEDUA TANGAN DIANGKAT: {hold_duration:.1f}s"
+                            elif position == "LeftHandRaised":
+                                active_gesture_text = f"Tangan Kiri Diangkat (Tahan: {hold_duration:.1f}s)"
+                                active_gesture_display = f"TANGAN KIRI DIANGKAT: {hold_duration:.1f}s"
+                            elif position == "RightHandRaised":
+                                active_gesture_text = f"Tangan Kanan Diangkat (Tahan: {hold_duration:.1f}s)"
+                                active_gesture_display = f"TANGAN KANAN DIANGKAT: {hold_duration:.1f}s"
+                
+                # Show debug info on frame for head position
+                cv2.putText(frame, f"X-diff: {x_diff:.3f}", (50, 100), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                cv2.putText(frame, f"Y-diff: {y_diff:.3f}", (50, 130), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                cv2.putText(frame, f"Head Position: {current_position}", (50, 160), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                
+                # Display active gesture (if any)
+                if head_gesture_active or arm_gesture_active:
+                    motion_detected = True
+                    self.label.text = active_gesture_text
+                    cv2.putText(frame, active_gesture_display, 
+                               (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, 
+                               (0, 255, 0) if active_gesture_type == "Head" else (0, 0, 255), 2)
+                else:
+                    if self.hold_positions["Neutral"] >= self.hold_frames_threshold:
+                        self.label.text = "Tahan Posisi untuk Deteksi"
+            
+            # Draw pose landmarks
+            self.mp_drawing.draw_landmarks(
+                frame_rgb, results_pose.pose_landmarks, self.mp_pose.POSE_CONNECTIONS)
+        
+        # Enhanced hand detection with history smoothing
+        if results_hands.multi_hand_landmarks:
+            for hand_landmarks, handedness in zip(results_hands.multi_hand_landmarks, 
+                                                results_hands.multi_handedness):
+                hand_type = handedness.classification[0].label
+                fingers = self.count_fingers(hand_landmarks, hand_type)
+                
+                # Add to history for smoothing
+                self.finger_count_history.append(fingers)
+                if len(self.finger_count_history) > self.history_length:
+                    self.finger_count_history.pop(0)
+                
+                # Use mode (most common value) for stability
+                smoothed_fingers = max(set(self.finger_count_history), 
+                                     key=self.finger_count_history.count)
+                
+                motion_detected = True
+                if smoothed_fingers > 0:
+                    self.label.text = f"{hand_type}: {smoothed_fingers} Jari"
+                    # Visual feedback
+                    cv2.putText(frame, f"{hand_type.upper()} HAND: {smoothed_fingers} fingers", 
+                               (50, 190), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+                else:
+                    self.label.text = f"{hand_type}: Kepalkan Tangan"
+                
+                # Draw hand landmarks
+                self.mp_drawing.draw_landmarks(
+                    frame_rgb, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
+        
+        if not motion_detected and not self.calibration_needed:
+            self.label.text = "Tahan Posisi Kepala untuk Deteksi"
+        
+        # Display frame
+        frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        buf = cv2.flip(frame, 0).tostring()
+        texture = Texture.create(size=(frame.shape[1], frame.shape[0]), colorfmt='bgr')
+        texture.blit_buffer(buf, colorfmt='bgr', bufferfmt='ubyte')
+        self.image.texture = texture
+    
+    def count_fingers(self, hand_landmarks, hand_type):
+        tip_ids = [4, 8, 12, 16, 20]
+        pip_ids = [3, 6, 10, 14, 18]
+        mcp_ids = [2, 5, 9, 13, 17]  # Added for more precise detection
+        fingers_up = 0
+        
+        # More sensitive thumb detection
+        thumb_tip = hand_landmarks.landmark[tip_ids[0]]
+        thumb_mcp = hand_landmarks.landmark[mcp_ids[0]]
+        
+        # Different logic based on hand type
+        if hand_type == "Right":
+            if thumb_tip.x < thumb_mcp.x - 0.05:  # More sensitive threshold
+                fingers_up += 1
+        else:
+            if thumb_tip.x > thumb_mcp.x + 0.05:  # More sensitive threshold
+                fingers_up += 1
+        
+        # More sensitive finger detection using multiple joints
+        for i in range(1, 5):
+            tip = hand_landmarks.landmark[tip_ids[i]]
+            pip = hand_landmarks.landmark[pip_ids[i]]
+            mcp = hand_landmarks.landmark[mcp_ids[i]]
+            
+            # Finger is up if tip is above both PIP and MCP joints
+            if tip.y < min(pip.y, mcp.y) - 0.02:  # Added small buffer
+                fingers_up += 1
+        
+        return fingers_up
+    
+    def stop_app(self, instance):
+        self.capture.release()
+        self.pose.close()
+        self.hands.close()
+        App.get_running_app().stop()
+
+if __name__ == '__main__':
+    MotionDetectorApp().run()
