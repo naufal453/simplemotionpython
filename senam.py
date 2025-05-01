@@ -1,28 +1,32 @@
 import cv2
 import numpy as np
-from kivy.app import App
-from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.label import Label
-from kivy.uix.button import Button
-from kivy.clock import Clock
-from kivy.graphics.texture import Texture
-from kivy.uix.image import Image
+import tkinter as tk
+from tkinter import ttk, Label, Button
+from PIL import Image, ImageTk
 import mediapipe as mp
+import math
 
-class MotionDetectorApp(App):
-    def build(self):
-        self.layout = BoxLayout(orientation='vertical', padding=10, spacing=10)
+class MotionDetectorApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Motion Detector")
         
         # UI Components
-        self.label = Label(text="Gerakan Belum Terdeteksi", font_size=24)
-        self.layout.add_widget(self.label)
+        self.label = Label(root, text="Gerakan Belum Terdeteksi", font=('Helvetica', 16))
+        self.label.pack(pady=10)
         
-        self.image = Image()
-        self.layout.add_widget(self.image)
+        self.video_frame = Label(root)
+        self.video_frame.pack()
         
-        button = Button(text="Keluar", size_hint=(1, 0.2))
-        button.bind(on_press=self.stop_app)
-        self.layout.add_widget(button)
+        self.finger_detection_enabled = tk.BooleanVar(value=True)
+        self.finger_checkbox = tk.Checkbutton(
+            root, text="Aktifkan Deteksi Jari", variable=self.finger_detection_enabled,
+            font=('Helvetica', 10)
+        )
+        self.finger_checkbox.pack(pady=5)
+        
+        self.button = Button(root, text="Keluar", command=self.stop_app, height=2)
+        self.button.pack(fill=tk.X, padx=10, pady=10)
         
         # Initialize camera
         self.capture = cv2.VideoCapture(0)
@@ -65,7 +69,9 @@ class MotionDetectorApp(App):
             "Right": 0,
             "Up": 0,
             "Down": 0,
-            "Neutral": 0
+            "Neutral": 0,
+            "TiltLeft": 0,
+            "TiltRight": 0
         }
         
         # Arm position tracking
@@ -76,7 +82,12 @@ class MotionDetectorApp(App):
             "ArmsDown": 0,
             "BothHandsRaised": 0,
             "RightHandRaised": 0,
-            "LeftHandRaised": 0
+            "LeftHandRaised": 0,
+            "RightCrossLeft": 0,
+            "LeftCrossRight": 0,
+            "RightCrossRight": 0,
+            "LeftCrossLeft": 0,
+            "ArmsCrossed": 0   # <--- Tambahkan ini
         }
         self.arm_hold_threshold = 15  # Frames to consider arm position held
         self.arm_extension_threshold = 0.15  # How far arm needs to be from body
@@ -86,10 +97,17 @@ class MotionDetectorApp(App):
         self.finger_count_history = []
         self.history_length = 5
         
-        Clock.schedule_interval(self.update_frame, 1.0/30.0)
-        return self.layout
+        self.update_frame()
     
-    def update_frame(self, dt):
+    def calculate_angle(self, a, b, c):
+        """Menghitung sudut (dalam derajat) di titik b dari tiga titik a-b-c."""
+        ba = np.array([a.x - b.x, a.y - b.y])
+        bc = np.array([c.x - b.x, c.y - b.y])
+        cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
+        angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
+        return np.degrees(angle)
+    
+    def update_frame(self):
         ret, frame = self.capture.read()
         if not ret:
             return
@@ -142,28 +160,45 @@ class MotionDetectorApp(App):
                         self.neutral_nose_y = 0.9 * self.neutral_nose_y + 0.1 * current_nose_y
                     
                     self.calibration_frames += 1
-                    self.label.text = f"Kalibrasi... {self.calibration_frames}/{self.calibration_threshold}"
+                    self.label.config(text=f"Kalibrasi... {self.calibration_frames}/{self.calibration_threshold}")
                     cv2.putText(frame, f"KALIBRASI: {self.calibration_frames}/{self.calibration_threshold}", 
                                (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
                 else:
                     self.calibration_needed = False
-                    self.label.text = "Kalibrasi Selesai - Siap Deteksi"
+                    self.label.config(text="Kalibrasi Selesai - Siap Deteksi")
             else:
                 # Calculate position relative to neutral
                 x_diff = current_nose_x - self.neutral_nose_x
                 y_diff = current_nose_y - self.neutral_nose_y
-                
-                # Determine current head position
+
+                horizontal_strength = abs(x_diff)
+                vertical_strength = abs(y_diff)
+                movement_ratio = horizontal_strength / (vertical_strength + 1e-6)
+                strong_threshold = 0.08
+
+                # Ambil landmark telinga
+                left_ear = landmarks[self.mp_pose.PoseLandmark.LEFT_EAR]
+                right_ear = landmarks[self.mp_pose.PoseLandmark.RIGHT_EAR]
+
+                # Hitung kemiringan kepala (selisih y telinga)
+                ear_y_diff = left_ear.y - right_ear.y
+                tilt_threshold = 0.04  # threshold kemiringan, bisa disesuaikan
+
                 current_position = "Neutral"
-                if abs(x_diff) > abs(y_diff):  # Horizontal movement is dominant
-                    if x_diff > self.head_movement_threshold:
+                if abs(ear_y_diff) > tilt_threshold:
+                    if ear_y_diff > 0:
+                        current_position = "TiltRight"  # Kepala miring ke kanan (telinga kiri lebih rendah)
+                    else:
+                        current_position = "TiltLeft"   # Kepala miring ke kiri (telinga kanan lebih rendah)
+                elif movement_ratio > 1.5 and horizontal_strength > strong_threshold:
+                    if x_diff > 0:
                         current_position = "Right"
-                    elif x_diff < -self.head_movement_threshold:
+                    else:
                         current_position = "Left"
-                else:  # Vertical movement is dominant
-                    if y_diff > self.head_movement_threshold:
+                elif movement_ratio < 0.67 and vertical_strength > strong_threshold:
+                    if y_diff > 0:
                         current_position = "Down"
-                    elif y_diff < -self.head_movement_threshold:
+                    else:
                         current_position = "Up"
                 
                 # Update head position hold counters
@@ -188,8 +223,56 @@ class MotionDetectorApp(App):
                 left_hand_raised = left_wrist.y < left_shoulder.y - self.hand_raise_threshold
                 right_hand_raised = right_wrist.y < right_shoulder.y - self.hand_raise_threshold
                 
+                # Calculate elbow angles
+                right_elbow_angle = self.calculate_angle(right_shoulder, right_elbow, right_wrist)
+                left_elbow_angle = self.calculate_angle(left_shoulder, left_elbow, left_wrist)
+                
                 current_arm_position = "ArmsDown"
-                if left_hand_raised and right_hand_raised:
+                crossed_threshold = 0.10  # threshold jarak antara pergelangan tangan (bisa disesuaikan)
+                wrist_distance = np.sqrt(
+                    (left_wrist.x - right_wrist.x) ** 2 +
+                    (left_wrist.y - right_wrist.y) ** 2
+                )
+                # Cek apakah kedua pergelangan tangan saling berdekatan dan berada di antara bahu
+                if (
+                    wrist_distance < crossed_threshold and
+                    min(left_shoulder.x, right_shoulder.x) < left_wrist.x < max(left_shoulder.x, right_shoulder.x) and
+                    min(left_shoulder.x, right_shoulder.x) < right_wrist.x < max(left_shoulder.x, right_shoulder.x)
+                ):
+                    current_arm_position = "ArmsCrossed"
+                elif (
+                    right_wrist.x < left_shoulder.x and
+                    right_wrist.y > left_shoulder.y + 0.05 and
+                    abs(right_wrist.y - left_shoulder.y) > 0.10 and
+                    abs(right_wrist.x - left_shoulder.x) > 0.05 and
+                    right_elbow_angle < 60
+                ):
+                    current_arm_position = "RightCrossLeft"
+                elif (
+                    left_wrist.x > right_shoulder.x and
+                    left_wrist.y > right_shoulder.y + 0.05 and
+                    abs(left_wrist.y - right_shoulder.y) > 0.10 and
+                    abs(left_wrist.x - right_shoulder.x) > 0.05 and
+                    left_elbow_angle < 60
+                ):
+                    current_arm_position = "LeftCrossRight"
+                elif (
+                    right_wrist.x > right_shoulder.x and
+                    right_wrist.y > right_shoulder.y + 0.05 and
+                    abs(right_wrist.y - right_shoulder.y) > 0.10 and
+                    abs(right_wrist.x - right_shoulder.x) > 0.05 and
+                    right_elbow_angle < 60
+                ):
+                    current_arm_position = "RightCrossRight"
+                elif (
+                    left_wrist.x < left_shoulder.x and
+                    left_wrist.y > left_shoulder.y + 0.05 and
+                    abs(left_wrist.y - left_shoulder.y) > 0.10 and
+                    abs(left_wrist.x - left_shoulder.x) > 0.05 and
+                    left_elbow_angle < 60
+                ):
+                    current_arm_position = "LeftCrossLeft"
+                elif left_hand_raised and right_hand_raised:
                     current_arm_position = "BothHandsRaised"
                 elif left_hand_raised:
                     current_arm_position = "LeftHandRaised"
@@ -201,6 +284,12 @@ class MotionDetectorApp(App):
                     current_arm_position = "LeftArmExtended"
                 elif right_arm_extended:
                     current_arm_position = "RightArmExtended"
+                
+                # Debug info untuk sudut siku
+                cv2.putText(frame, f"Right Elbow Angle: {right_elbow_angle:.1f}", (400, 190),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+                cv2.putText(frame, f"Left Elbow Angle: {left_elbow_angle:.1f}", (400, 220),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
                 
                 # Update arm position hold counters
                 for position in self.arm_positions:
@@ -231,6 +320,9 @@ class MotionDetectorApp(App):
                             if position in ["Left", "Right"]:
                                 active_gesture_text = f"Kepala Geleng ke {position} (Tahan: {hold_duration:.1f}s)"
                                 active_gesture_display = f"GELENG {position.upper()}: {hold_duration:.1f}s"
+                            elif position in ["TiltLeft", "TiltRight"]:
+                                active_gesture_text = f"Kepala Miring ke {position} (Tahan: {hold_duration:.1f}s)"
+                                active_gesture_display = f"MIRING {position.upper()}: {hold_duration:.1f}s"
                             else:
                                 active_gesture_text = f"Kepala Angguk ke {position} (Tahan: {hold_duration:.1f}s)"
                                 active_gesture_display = f"ANGGUK {position.upper()}: {hold_duration:.1f}s"
@@ -250,11 +342,11 @@ class MotionDetectorApp(App):
                                 active_gesture_text = f"Kedua Tangan Direntangkan (Tahan: {hold_duration:.1f}s)"
                                 active_gesture_display = f"KEDUA TANGAN DIRENTANGKAN: {hold_duration:.1f}s"
                             elif position == "LeftArmExtended":
-                                active_gesture_text = f"Tangan Kiri Direntangkan (Tahan: {hold_duration:.1f}s)"
-                                active_gesture_display = f"TANGAN KIRI DIRENTANGKAN: {hold_duration:.1f}s"
-                            elif position == "RightArmExtended":
                                 active_gesture_text = f"Tangan Kanan Direntangkan (Tahan: {hold_duration:.1f}s)"
                                 active_gesture_display = f"TANGAN KANAN DIRENTANGKAN: {hold_duration:.1f}s"
+                            elif position == "RightArmExtended":
+                                active_gesture_text = f"Tangan Kiri Direntangkan (Tahan: {hold_duration:.1f}s)"
+                                active_gesture_display = f"TANGAN KIRI DIRENTANGKAN: {hold_duration:.1f}s"
                             elif position == "BothHandsRaised":
                                 active_gesture_text = f"Kedua Tangan Diangkat (Tahan: {hold_duration:.1f}s)"
                                 active_gesture_display = f"KEDUA TANGAN DIANGKAT: {hold_duration:.1f}s"
@@ -264,6 +356,21 @@ class MotionDetectorApp(App):
                             elif position == "RightHandRaised":
                                 active_gesture_text = f"Tangan Kanan Diangkat (Tahan: {hold_duration:.1f}s)"
                                 active_gesture_display = f"TANGAN KANAN DIANGKAT: {hold_duration:.1f}s"
+                            elif position == "RightCrossLeft":
+                                active_gesture_text = f"Tangan Kanan Menyilang ke Kiri Bawah (Tahan: {hold_duration:.1f}s)"
+                                active_gesture_display = f"KANAN SILANG KIRI: {hold_duration:.1f}s"
+                            elif position == "LeftCrossRight":
+                                active_gesture_text = f"Tangan Kiri Menyilang ke Kanan Bawah (Tahan: {hold_duration:.1f}s)"
+                                active_gesture_display = f"KIRI SILANG KANAN: {hold_duration:.1f}s"
+                            elif position == "RightCrossRight":
+                                active_gesture_text = f"Tangan Kanan Menyilang ke Kanan Bawah (Tahan: {hold_duration:.1f}s)"
+                                active_gesture_display = f"KANAN SILANG KANAN: {hold_duration:.1f}s"
+                            elif position == "LeftCrossLeft":
+                                active_gesture_text = f"Tangan Kiri Menyilang ke Kiri Bawah (Tahan: {hold_duration:.1f}s)"
+                                active_gesture_display = f"KIRI SILANG KIRI: {hold_duration:.1f}s"
+                            elif position == "ArmsCrossed":
+                                active_gesture_text = f"Kedua Tangan Menyilang di Depan Badan (Tahan: {hold_duration:.1f}s)"
+                                active_gesture_display = f"KEDUA TANGAN MENYILANG: {hold_duration:.1f}s"
                 
                 # Show debug info on frame for head position
                 cv2.putText(frame, f"X-diff: {x_diff:.3f}", (50, 100), 
@@ -276,22 +383,22 @@ class MotionDetectorApp(App):
                 # Display active gesture (if any)
                 if head_gesture_active or arm_gesture_active:
                     motion_detected = True
-                    self.label.text = active_gesture_text
+                    self.label.config(text=active_gesture_text)
                     cv2.putText(frame, active_gesture_display, 
                                (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, 
                                (0, 255, 0) if active_gesture_type == "Head" else (0, 0, 255), 2)
                 else:
                     if self.hold_positions["Neutral"] >= self.hold_frames_threshold:
-                        self.label.text = "Tahan Posisi untuk Deteksi"
+                        self.label.config(text="Tahan Posisi untuk Deteksi")
             
             # Draw pose landmarks
             self.mp_drawing.draw_landmarks(
                 frame_rgb, results_pose.pose_landmarks, self.mp_pose.POSE_CONNECTIONS)
         
         # Enhanced hand detection with history smoothing
-        if results_hands.multi_hand_landmarks:
+        if self.finger_detection_enabled.get() and results_hands.multi_hand_landmarks:
             for hand_landmarks, handedness in zip(results_hands.multi_hand_landmarks, 
-                                                results_hands.multi_handedness):
+                                                  results_hands.multi_handedness):
                 hand_type = handedness.classification[0].label
                 fingers = self.count_fingers(hand_landmarks, hand_type)
                 
@@ -306,26 +413,35 @@ class MotionDetectorApp(App):
                 
                 motion_detected = True
                 if smoothed_fingers > 0:
-                    self.label.text = f"{hand_type}: {smoothed_fingers} Jari"
+                    self.label.config(text=f"{hand_type}: {smoothed_fingers} Jari")
                     # Visual feedback
                     cv2.putText(frame, f"{hand_type.upper()} HAND: {smoothed_fingers} fingers", 
                                (50, 190), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
                 else:
-                    self.label.text = f"{hand_type}: Kepalkan Tangan"
+                    self.label.config(text=f"{hand_type}: Kepalkan Tangan")
                 
                 # Draw hand landmarks
                 self.mp_drawing.draw_landmarks(
                     frame_rgb, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
+        elif not self.finger_detection_enabled.get():
+            # Jika deteksi jari dimatikan, tampilkan info
+            cv2.putText(frame, "Deteksi Jari: OFF", (50, 320), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (100, 100, 100), 2)
         
         if not motion_detected and not self.calibration_needed:
-            self.label.text = "Tahan Posisi Kepala untuk Deteksi"
+            self.label.config(text="Tahan Posisi Kepala untuk Deteksi")
         
-        # Display frame
+        # Convert frame to PhotoImage for Tkinter
         frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-        buf = cv2.flip(frame, 0).tostring()
-        texture = Texture.create(size=(frame.shape[1], frame.shape[0]), colorfmt='bgr')
-        texture.blit_buffer(buf, colorfmt='bgr', bufferfmt='ubyte')
-        self.image.texture = texture
+        img = Image.fromarray(frame)
+        imgtk = ImageTk.PhotoImage(image=img)
+        
+        # Update the video frame
+        self.video_frame.imgtk = imgtk
+        self.video_frame.configure(image=imgtk)
+        
+        # Schedule the next update
+        self.root.after(10, self.update_frame)
     
     def count_fingers(self, hand_landmarks, hand_type):
         tip_ids = [4, 8, 12, 16, 20]
@@ -357,11 +473,13 @@ class MotionDetectorApp(App):
         
         return fingers_up
     
-    def stop_app(self, instance):
+    def stop_app(self):
         self.capture.release()
         self.pose.close()
         self.hands.close()
-        App.get_running_app().stop()
+        self.root.destroy()
 
 if __name__ == '__main__':
-    MotionDetectorApp().run()
+    root = tk.Tk()
+    app = MotionDetectorApp(root)
+    root.mainloop()
