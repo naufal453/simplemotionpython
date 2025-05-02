@@ -27,6 +27,10 @@ class MotionDetectorApp:
         
         self.button = Button(root, text="Keluar", command=self.stop_app, height=2)
         self.button.pack(fill=tk.X, padx=10, pady=10)
+
+        # Tombol kalibrasi ulang
+        self.recalib_button = Button(root, text="Kalibrasi Ulang", command=self.recalibrate, height=1)
+        self.recalib_button.pack(fill=tk.X, padx=10, pady=(0,10))
         
         # Initialize camera
         self.capture = cv2.VideoCapture(0)
@@ -179,13 +183,22 @@ class MotionDetectorApp:
                 # Ambil landmark telinga
                 left_ear = landmarks[self.mp_pose.PoseLandmark.LEFT_EAR]
                 right_ear = landmarks[self.mp_pose.PoseLandmark.RIGHT_EAR]
+                # Ambil dagu (gunakan landmark mulut bawah jika dagu tidak ada)
+                chin = landmarks[self.mp_pose.PoseLandmark.MOUTH_BOTTOM] if hasattr(self.mp_pose.PoseLandmark, "MOUTH_BOTTOM") else None
 
                 # Hitung kemiringan kepala (selisih y telinga)
                 ear_y_diff = left_ear.y - right_ear.y
                 tilt_threshold = 0.04  # threshold kemiringan, bisa disesuaikan
 
+                # --- Tambahan deteksi mendongak ---
+                # Jika hidung lebih tinggi dari rata-rata telinga, anggap mendongak
+                avg_ear_y = (left_ear.y + right_ear.y) / 2
+                look_up_threshold = 0.03  # threshold sensitifitas mendongak
+
                 current_position = "Neutral"
-                if abs(ear_y_diff) > tilt_threshold:
+                if nose.y < avg_ear_y - look_up_threshold:
+                    current_position = "Up"
+                elif abs(ear_y_diff) > tilt_threshold:
                     if ear_y_diff > 0:
                         current_position = "TiltRight"  # Kepala miring ke kanan (telinga kiri lebih rendah)
                     else:
@@ -472,6 +485,14 @@ class MotionDetectorApp:
                 fingers_up += 1
         
         return fingers_up
+    
+    def recalibrate(self):
+        """Reset kalibrasi posisi kepala."""
+        self.calibration_needed = True
+        self.calibration_frames = 0
+        self.neutral_nose_x = None
+        self.neutral_nose_y = None
+        self.label.config(text="Kalibrasi Ulang Dimulai...")
     
     def stop_app(self):
         self.capture.release()
