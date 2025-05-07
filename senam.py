@@ -5,6 +5,9 @@ from tkinter import ttk, Label, Button, StringVar
 from PIL import Image, ImageTk
 import mediapipe as mp
 import math
+import tkinter.messagebox as messagebox
+import threading
+import time
 
 class MotionDetectorApp:
     def __init__(self, root):
@@ -93,6 +96,9 @@ class MotionDetectorApp:
         self.movement_hold_frames = {key: 0 for _, key in self.movement_list}
         self.movement_hold_target = 8 * 30  # 8 detik * 30 fps
 
+        # Add this new attribute for tracking shown popups
+        self.popup_shown = {key: False for _, key in self.movement_list}
+
         # Initialize camera
         self.capture = cv2.VideoCapture(0)
 
@@ -171,6 +177,36 @@ class MotionDetectorApp:
         cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
         angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
         return np.degrees(angle)
+
+    def show_popup(self, message):
+        """Show popup in a separate thread"""
+        def popup():
+            popup_window = tk.Toplevel(self.root)
+            popup_window.overrideredirect(True)  # Remove window decorations
+            
+            # Calculate position (center of screen)
+            screen_width = self.root.winfo_screenwidth()
+            screen_height = self.root.winfo_screenheight()
+            width = 300
+            height = 100
+            x = (screen_width - width) // 2
+            y = (screen_height - height) // 2
+            
+            popup_window.geometry(f"{width}x{height}+{x}+{y}")
+            popup_window.configure(bg="#00adb5")
+            
+            # Add message
+            label = Label(popup_window, text=message, 
+                         font=('Segoe UI', 12, 'bold'),
+                         bg="#00adb5", fg="white",
+                         wraplength=280)
+            label.pack(expand=True)
+            
+            # Close after 3 seconds
+            self.root.after(3000, popup_window.destroy)
+        
+        # Run in main thread to avoid tkinter threading issues
+        self.root.after(0, popup)
 
     def update_frame(self):
         ret, frame = self.capture.read()
@@ -508,9 +544,18 @@ class MotionDetectorApp:
                 self.movement_hold_frames[key] = 0
 
             # Jika sudah 8 detik, checklist
-            if self.movement_hold_frames[key] >= self.movement_hold_target and not self.movement_status[key]:
+            if (self.movement_hold_frames[key] >= self.movement_hold_target 
+                and not self.movement_status[key] 
+                and not self.popup_shown[key]):
+                
                 self.movement_vars[key].set("✅ " + label)
                 self.movement_status[key] = True
+                self.popup_shown[key] = True
+                
+                # Show success popup
+                popup_message = f"Berhasil!\nGerakan '{label}' telah dilakukan dengan benar!"
+                self.show_popup(popup_message)
+                
             elif not self.movement_status[key]:
                 self.movement_vars[key].set("❌ " + label)
 
